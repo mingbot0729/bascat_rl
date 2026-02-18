@@ -1,0 +1,1 @@
+controller_joint_names: ['right_roll_joint', 'left_roll_joint', 'left_upper_leg_joint', 'left_lower_leg_joint', 'right_roll_joint', 'right_upper_leg_joint', 'right_lower_leg_joint', ]

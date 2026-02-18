@@ -19,8 +19,8 @@ import cli_args  # isort: skip
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
-parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
-parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
+parser.add_argument("--video_length", type=int, default=1000, help="Length of the recorded video (in steps).")
+parser.add_argument("--video_interval", type=int, default=5000, help="Interval between video recordings (in steps).")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
@@ -37,6 +37,26 @@ args_cli, hydra_args = parser.parse_known_args()
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
+
+# resolve task: from --task, or consume Hydra-style task=... (and remove it from hydra args)
+def _pop_task_override(args: list[str]) -> tuple[str | None, list[str]]:
+    task = None
+    remaining: list[str] = []
+    for arg in args:
+        if task is None and arg.startswith("task="):
+            task = arg.split("=", 1)[1].strip()
+        else:
+            remaining.append(arg)
+    return task, remaining
+
+
+task_from_hydra, hydra_args = _pop_task_override(hydra_args)
+args_cli.task = args_cli.task if args_cli.task is not None else task_from_hydra
+if args_cli.task is None:
+    print("Error: Task not specified. Use --task Isaac-Velocity-Rough-Ostrich-v0 or task=Isaac-Velocity-Rough-Ostrich-v0")
+    print("  Flat:  --task Isaac-Velocity-Flat-Ostrich-v0")
+    print("  Rough: --task Isaac-Velocity-Rough-Ostrich-v0")
+    sys.exit(1)
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -94,6 +114,12 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import bascat_rl.tasks  # noqa: F401
 
+# Optional: log average leg contact force every N steps (set log_interval=None to disable)
+try:
+    from contact_force_logger import ContactForceLoggingWrapper
+except ImportError:
+    ContactForceLoggingWrapper = None
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
@@ -114,6 +140,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+
+    # video recording: render every step to reduce blinking/flickering
+    if args_cli.video:
+        env_cfg.sim.render_interval = 1
 
     # multi-gpu training configuration
     if args_cli.distributed:
@@ -140,13 +170,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
+    # log average leg contact forces during training (every 500 steps) and add live values panel in UI
+    if ContactForceLoggingWrapper is not None:
+        env = ContactForceLoggingWrapper(env, log_interval=500)
+        if not getattr(args_cli, "headless", True):
+            print("[INFO] Contact force logging enabled. Live values panel will appear in the right IsaacLab window (scroll down).")
+    else:
+        print("[INFO] ContactForceLoggingWrapper not loaded (run from scripts/rsl_rl or fix import). Live contact force panel will not appear.")
+
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
     # save resume path before creating a new log_dir
+    resume_path = None
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        # If user requested resume but the experiment folder doesn't exist yet, start fresh.
+        if not os.path.isdir(log_root_path):
+            print(
+                f"[WARN] Resume requested but log directory does not exist: {log_root_path}\n"
+                "[WARN] Starting a fresh run (set --resume only after you have a saved checkpoint)."
+            )
+            agent_cfg.resume = False
+        else:
+            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # wrap for video recording
     if args_cli.video:
@@ -169,6 +216,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+        if resume_path is None:
+            raise RuntimeError("resume_path was not resolved but resume is enabled. This is a bug.")
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)

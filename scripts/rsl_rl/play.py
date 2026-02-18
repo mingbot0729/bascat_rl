@@ -63,6 +63,17 @@ from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
 
 import bascat_rl.tasks  # noqa: F401
 
+# Optional: live contact force panel in the right-side debug window (ensure script dir is on path)
+import sys
+import os
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+try:
+    from contact_force_logger import ContactForceLoggingWrapper
+except ImportError:
+    ContactForceLoggingWrapper = None
+
 
 def main():
     """Play with RSL-RL agent."""
@@ -71,6 +82,10 @@ def main():
     env_cfg = parse_env_cfg(
         args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs, use_fabric=not args_cli.disable_fabric
     )
+    # video recording: use num_envs=1 for smooth single-view recording, render every step
+    if args_cli.video:
+        env_cfg.scene.num_envs = 1
+        env_cfg.sim.render_interval = 1
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(task_name, args_cli)
 
     # specify directory for logging experiments
@@ -91,6 +106,13 @@ def main():
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+    # add live contact force panel to the right IsaacLab window (scroll down to see values)
+    if ContactForceLoggingWrapper is not None:
+        env = ContactForceLoggingWrapper(env, log_interval=1000)
+        print("[INFO] Contact force live panel enabled. In the right panel, scroll down to see 'Contact Forces (Live) — values'.")
+    else:
+        print("[INFO] Run from scripts/rsl_rl to enable the contact force live panel.")
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):

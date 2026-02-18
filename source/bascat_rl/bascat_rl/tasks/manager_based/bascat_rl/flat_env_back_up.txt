@@ -1,0 +1,313 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# SPDX-License-Identifier: BSD-3-Clause
+
+import math
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.utils import configclass
+from isaaclab.managers import ObservationTermCfg
+from .observations_zero import base_lin_vel_zero
+
+import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
+from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
+    LocomotionVelocityRoughEnvCfg,
+    RewardsCfg,
+    TerminationsCfg,
+)
+from isaaclab.managers import EventTermCfg as EventTerm
+from . import mdp as mdp_local
+from .ostrich import OSTRICH_CFG
+
+
+# --- Standing-only reward stack: posture → symmetry → stillness (no gait/air time until it stands nicely) ---
+
+
+@configclass
+class OstrichFlatRewardsCfg(RewardsCfg):
+    """Minimal reward stack for learning to stand: posture, stillness, stability, symmetry, calmness. No gait."""
+
+    # ----- Posture -----
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-10.0)
+    base_height_target_exp = RewTerm(
+        func=mdp_local.base_height_target_exp,
+        weight=0.5,
+        params={"target_height": 0.22, "std": 0.03},
+    )
+
+    # ----- Stillness (standing must dominate) -----
+    track_lin_vel_xy_exp = RewTerm(
+        func=mdp.track_lin_vel_xy_exp,
+        weight=4.0,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.01)},
+    )
+    track_ang_vel_z_exp = RewTerm(
+        func=mdp.track_ang_vel_z_exp,
+        weight=2.0,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.01)},
+    )
+    base_pos_xy_drift_l2 = RewTerm(
+        func=mdp_local.base_pos_xy_drift_l2,
+        weight=-2.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names="base_link")},
+    )
+
+    # ----- Stability -----
+    joint_deviation_roll = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.05,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_roll_joint"])},
+    )
+    joint_deviation_legs = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.005,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_upper_leg_joint", ".*_lower_leg_joint"])},
+    )
+    dof_pos_limits = RewTerm(
+        func=mdp.joint_pos_limits,
+        weight=-10.0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=[".*_upper_leg_joint", ".*_lower_leg_joint", ".*_roll_joint"],
+            ),
+        },
+    )
+
+    # ----- Symmetry (left/right match) -----
+    left_right_joint_sym_l2 = RewTerm(func=mdp_local.left_right_joint_sym_l2, weight=-0.2)
+    action_sym_l2 = RewTerm(func=mdp_local.action_sym_l2, weight=-0.05)
+
+    # ----- Calmness (no fast micro-stepping / buzzing) -----
+    contact_switch_penalty = RewTerm(
+        func=mdp_local.contact_switch_penalty,
+        weight=-1.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_lower_leg_link"),
+            "threshold": 0.2,
+        },
+    )
+
+    # ----- Lower leg (foot)–ground contact: penalize excessively high force -----
+    foot_contact_force_penalty = RewTerm(
+        func=mdp_local.foot_contact_force_penalty,
+        weight=-0.1,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_lower_leg_link"),
+            "force_threshold": 30.0,
+        },
+    )
+
+    # ----- Failure -----
+    termination_penalty = RewTerm(
+        func=mdp_local.termination_penalty_scaled,
+        weight=1.0,
+        params={"max_penalty": 1000.0},
+    )
+
+    # ----- Disabled (reintroduce after standing nicely) -----
+    feet_air_time = None
+    feet_air_time_positive_biped = None
+    gait_alternating_phase = None
+    flat_posture_when_biped = None
+    foot_slip_penalty = None
+    base_height_l2 = None
+    undesired_contacts = None
+
+
+@configclass
+class OstrichFlatTerminationsCfg(TerminationsCfg):
+    """Terminations for standing-still biped: time_out, base contact (fall), knee contact."""
+
+    time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    base_contact = DoneTerm(
+        func=mdp.illegal_contact,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*base_link"), "threshold": 1.0},
+    )
+    knee_contact = DoneTerm(
+        func=mdp.illegal_contact,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*left_upper_leg_link", ".*right_upper_leg_link"]),
+            "threshold": 10.0,
+        },
+    )
+
+
+@configclass
+class OstrichFlatEnvCfg(LocomotionVelocityRoughEnvCfg):
+    """Ostrich flat env: standing still with nice biped (single-stance) and flat body."""
+
+    rewards: OstrichFlatRewardsCfg = OstrichFlatRewardsCfg()
+    terminations: OstrichFlatTerminationsCfg = OstrichFlatTerminationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        
+        # ===== ROBOT CONFIGURATION =====
+        self.scene.robot = OSTRICH_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        # --- IMU sensor (mount to your base link; change name if your link differs) ---
+        # self.scene.imu = ImuCfg(
+        #     prim_path="{ENV_REGEX_NS}/Robot/base_link",   # or ".../base" if that's your link
+        #     # optional: align/offset the sensor frame
+        #     # offset=ImuCfg.OffsetCfg(pos=(0,0,0), rot=(1,0,0,0)),
+        #     gravity_bias=(0.0, 0.0, 9.81),
+        # )
+        # # sample the IMU every physics step (downsample with self.decimation*self.sim.dt if you prefer)
+        # self.scene.imu.update_period = self.sim.dt
+        # # --- add IMU-based observations for the policy ---
+        # self.observations.policy.imu_ang_vel = ObservationTermCfg(
+        #     func=mdp.imu_ang_vel,
+        #     params={"asset_cfg": SceneEntityCfg("imu")},
+        #     noise=Unoise(n_min=-0.01, n_max=0.01),   # was {"mean":..., "std":...}
+        # )
+
+        # self.observations.policy.imu_lin_acc = ObservationTermCfg(
+        #     func=mdp.imu_lin_acc,
+        #     params={"asset_cfg": SceneEntityCfg("imu")},
+        #     noise=Unoise(n_min=-0.01, n_max=0.01),   # was dict
+        # )
+
+        # self.observations.policy.base_lin_vel = None
+        # self.observations.policy.base_ang_vel = None
+        # self.observations.policy.base_lin_vel = ObservationTermCfg(
+        #     func=base_lin_vel_zero
+        # )
+
+        
+        # ===== TERRAIN CONFIGURATION =====
+        # Change to random uniform terrain with height noise for domain randomization
+        from isaaclab.terrains.height_field import HfRandomUniformTerrainCfg
+        from isaaclab.terrains import TerrainGeneratorCfg
+        
+        self.scene.terrain.terrain_type = "plane"
+        # self.scene.terrain.terrain_generator = TerrainGeneratorCfg(
+        #     size=(5.0, 5.0),  # Larger terrain per robot
+        #     num_rows=6,  # 1 row
+        #     num_cols=6,  # 1 column = 1 terrain per robot
+        #     horizontal_scale=0.1,
+        #     vertical_scale=0.005,
+        #     sub_terrains={
+        #         "random_uniform": HfRandomUniformTerrainCfg(
+        #             proportion=1.0,
+        #             noise_range=(0.0, 0.02),  # Height noise U(0.0, 0.02) m
+        #             noise_step=0.005,  # Step size = 0.005 m
+        #             downsampled_scale=0.2,  # Sample every 20cm for smoother terrain
+        #         )
+        #     }
+        # )
+        # self.scene.height_scanner.prim_path = "/World/envs/env_.*/Robot/base_link"
+        self.scene.height_scanner = None
+        self.observations.policy.height_scan = None
+        # Remove terrain curriculum since we want random terrain
+        self.curriculum.terrain_levels = None
+        
+        # ===== SIMULATION PARAMETERS =====
+        # Optimized for stability and MuJoCo compatibility
+        self.decimation = 2  # 50 Hz control frequency (matches our MuJoCo setup)
+        self.episode_length_s = 50.0  # Longer episodes for better learning
+        self.sim.dt = 0.005  # 200 Hz physics (matches our MuJoCo setup)
+        
+        # ===== SCENE CONFIGURATION =====
+        # Increase spacing between robots for better visualization
+        # self.scene.num_envs = 10  # Reduce number of environments
+        self.scene.env_spacing = 2.0  # 10 meters between each robot
+        
+        # ===== ACTION CONFIGURATION =====
+        # Optimized scaling for stable control
+        self.actions.joint_pos.scale = 0.5  # Conservative scaling for stability
+        # Set specific limits for each individual joint
+        self.actions.joint_pos.clip = {
+            # Roll joints (more restricted for stability)
+            "left_roll_joint": (-0.873, 0.209),
+            "right_roll_joint": (-0.209, 0.873),
+            
+            # Upper leg joints (hip joints - more freedom)
+            "left_upper_leg_joint": (-0.785 , 0.785),
+            "right_upper_leg_joint": (-0.785, 0.785),
+            
+            # Lower leg joints (knee joints - moderate range)
+            "left_lower_leg_joint": (-0.523, 0.785),
+            "right_lower_leg_joint": (-0.785, 0.523),
+
+            # "left_hip_joint": (-0.523599, 0.523599),
+            # "right_hip_joint": (-0.523599, 0.523599),
+        }
+        
+        # ===== OBSERVATION CONFIGURATION =====
+        # Disable observations not needed for flat terrain
+        self.observations.policy.enable_corruption = True  # Keep some noise for robustness
+        
+        # ===== EVENT CONFIGURATION =====
+        # Reduce randomization for initial flat terrain training
+        # self.events.push_robot = None  # Remove push events for stability
+        # Enable random push forces for robustness training
+        self.events.push_robot.params = {
+            "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+            "velocity_range": {
+                "x": (-0.1, 0.1), "y": (-0.1, 0.1), "z": (-0.1, 0.1),
+                "roll": (-0.1, 0.1), "pitch": (-0.1, 0.1), "yaw": (-0.1, 0.1),
+            },
+        }
+        self.events.push_robot.interval_range_s = (5.0, 10.0)  # More frequent pushes
+        # Keep floor and lower leg friction randomization on for sim2real
+        # self.events.physics_material, physics_material_lower_leg, randomize_terrain_friction stay enabled
+        self.events.add_base_mass = None
+        self.events.base_com = None
+        # Leave: reset_base, reset_robot_joints, physics_material, physics_material_lower_leg, randomize_terrain_friction
+
+        # Conservative joint initialization
+        self.events.reset_robot_joints.params["position_range"] = (-0.1, 0.1)  # Smaller range
+
+        # Lower leg joint friction randomization (foot–ground and joint friction)
+        # Use only friction_distribution_params (Isaac Lab expects this, not friction_range)
+        p = self.events.randomize_joint_parameters.params
+        p["asset_cfg"] = SceneEntityCfg("robot", joint_names=[".*_lower_leg_joint"])
+        p["friction_distribution_params"] = (0.0, 0.04)
+        p.pop("friction_range", None)  # remove if present from parent config
+        # Reintroduce after standing nicely: randomize_actuator_gains (keep joint params for friction)
+        self.events.randomize_actuator_gains = None
+
+        # Robust base reset
+        self.events.reset_base.params = {
+            "pose_range": {
+                "x": (-0.0, 0.0), "y": (-0.0, 0.0), "z": (-0.0, 0.0),
+                "roll": (-0.1, 0.1), "pitch": (-0.1, 0.1), "yaw": (-0.1, 0.1)  # Tilted orientations
+            },
+            "velocity_range": {
+                "x": (-0.0, 0.0), "y": (-0.0,0.0), "z": (-0.0, 0.0),
+                "roll": (-0.0, 0.0), "pitch": (-0.0, 0.0), "yaw": (-0.0, 0.0),
+            },
+        }
+        
+        # ===== COMMAND CONFIGURATION =====
+        # Zero command: train to stand first and learn proper gait (no velocity tracking)
+        self.commands.base_velocity.rel_standing_envs = 1.0  # All envs get zero command
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 0.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        self.commands.base_velocity.ranges.heading = (0.0, 0.0)
+
+
+@configclass
+class OstrichFlatEnvCfg_PLAY(OstrichFlatEnvCfg):
+    """Play configuration for testing trained policies."""
+    
+    def __post_init__(self):
+        # post init of parent
+        super().__post_init__()
+
+        # ===== SCENE CONFIGURATION =====
+        # Smaller scene for play/testing
+        self.scene.num_envs = 16  # Fewer envs for easier observation
+        self.scene.env_spacing = 3.0  # More space between robots
+        
+        # ===== COMMAND CONFIGURATION =====
+        # More interesting commands for demonstration
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.0, 0.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.0, 0.0) 
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.0, 0.0)
+        self.commands.base_velocity.ranges.heading = (-0.0, 0.0)  # Full rotation
+        
+        # ===== OBSERVATION CONFIGURATION =====
+        # Disable noise/corruption for cleaner testing
+        self.observations.policy.enable_corruption = False
